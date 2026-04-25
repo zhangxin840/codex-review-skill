@@ -7,13 +7,14 @@ description: >
   "用 codex 审一下", "交叉验证", "第二意见", "让 codex 看看", "codex review",
   "double check with codex", "get another perspective", or after completing a plan
   when the user wants validation before proceeding. This skill runs codex exec
-  in read-only mode to provide an independent review from a different AI model (GPT-5.x),
-  complementing Claude's own analysis.
+  in read-only mode using the model and reasoning effort configured in the user's
+  ~/.codex/config.toml, providing an independent review from a different AI model
+  that complements Claude's own analysis.
 ---
 
 # Codex Review
 
-Use Codex CLI (GPT-5.x) as an independent reviewer. Two different model families catching different issues is more reliable than one model reviewing itself.
+Use Codex CLI as an independent reviewer (model and reasoning effort come from the user's `~/.codex/config.toml`). Two different model families catching different issues is more reliable than one model reviewing itself.
 
 The key value is two models collaborating: Codex finds issues, Claude verifies before fixing. Every finding goes through a verification step because Codex has a ~15-20% false positive rate on complex diffs.
 
@@ -38,7 +39,7 @@ which codex && codex --version
 ### Mode 1: Plan Review
 
 1. Write plan to `/tmp/codex-review-input.md`
-2. Run Codex:
+2. Run Codex (set Bash timeout to 300000ms):
    ```bash
    codex exec \
      --sandbox read-only \
@@ -53,14 +54,15 @@ which codex && codex --version
 
    Be specific and actionable. If everything looks solid, say so briefly — don't manufacture issues.
    Output your review in markdown." \
-     2>/dev/null
+     2>&1 | grep -v '^\(Reading\|OpenAI Codex\|--------\|workdir:\|model:\|provider:\|approval:\|sandbox:\|reasoning\|session id:\|user\|codex\|exec\| succeeded\)' \
+     | tee /tmp/codex-review-output.md
    ```
 
 ### Mode 2: Code Review
 
 1. Capture diff: `git diff <ref1>..<ref2> -- <path> > /tmp/codex-review-input.md`
 2. Add context in the prompt (what changed, why, key files)
-3. Run Codex:
+3. Run Codex (set Bash timeout to 300000ms):
    ```bash
    codex exec \
      --sandbox read-only \
@@ -78,7 +80,8 @@ which codex && codex --version
    For each issue, specify the file and context. Rate severity: critical / warning / suggestion.
    If the code looks good, say so — don't manufacture issues.
    Output your review in markdown." \
-     2>/dev/null
+     2>&1 | grep -v '^\(Reading\|OpenAI Codex\|--------\|workdir:\|model:\|provider:\|approval:\|sandbox:\|reasoning\|session id:\|user\|codex\|exec\| succeeded\)' \
+     | tee /tmp/codex-review-output.md
    ```
 
 ## Post-Review: Verify-then-Fix Protocol
@@ -88,7 +91,7 @@ After receiving Codex output, do NOT blindly apply fixes. Each finding goes thro
 ### Step 1: Present Codex findings
 
 ```
-## Codex Review (GPT-5.x)
+## Codex Review (GPT-5.5)
 <Codex's review, cleaned up>
 ---
 *Reviewed by Codex CLI in read-only sandbox mode*
@@ -128,7 +131,7 @@ Include Codex review results in commit message so the review history is preserve
 ```
 fix: address Codex review findings — <summary>
 
-Fixes N issues from Codex review (GPT-5.x):
+Fixes N issues from Codex review (GPT-5.5):
 1. [severity] description — fix applied
 2. [severity] description — fix applied
 
@@ -150,7 +153,8 @@ Co-Authored-By: Claude <noreply@anthropic.com>
 
 - **Always use `--sandbox read-only`** — Codex should never modify files
 - **Always use `--full-auto`** — avoid interactive prompts that hang
-- **Stderr to /dev/null** (`2>/dev/null`) — Codex writes progress to stderr
+- **Merge stderr into stdout** (`2>&1`) — Codex writes progress/boot info to stderr; merging ensures output is captured even if the Bash tool auto-backgrounds the command. Pipe through `grep -v` to strip Codex boot lines, then `tee /tmp/codex-review-output.md` to both display and persist the review output
+- **Set Bash timeout to 300000ms** — Codex typically takes 60-180 seconds but can exceed 3 minutes on large reviews with multiple file reads. The default Bash timeout (120s) will auto-background the command and lose output. Always pass `timeout: 300000` (5 min) to the Bash tool. For >1000 line diffs or reviews that cross-reference many codebase files, use `timeout: 600000` (10 min)
+- **If output is empty**, read `/tmp/codex-review-output.md` — the `tee` fallback ensures output is saved even when Bash truncates or backgrounds
 - **Don't fabricate output** — if the command fails, report the error honestly
-- **Clean up** — `rm -f /tmp/codex-review-input.md` after review
-- **Timeout** — Codex typically takes 30-120 seconds; for >1000 line diffs, warn the user
+- **Clean up** — `rm -f /tmp/codex-review-input.md /tmp/codex-review-output.md` after review
