@@ -41,9 +41,9 @@ Claude will automatically capture the relevant diff, run Codex, verify findings,
 
 ```
 codex-review/
-├── SKILL.md                    # Skill instructions (156 lines)
+├── SKILL.md                    # Skill instructions
 └── scripts/
-    └── codex-review.sh         # Helper script for plan/code review
+    └── codex-review.sh         # Helper: plan | code | git-uncommitted | git-base <branch> | git-commit <sha>
 ```
 
 ## License
