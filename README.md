@@ -1,13 +1,17 @@
 # Codex Review Skill
 
-A Claude Code skill that uses [OpenAI Codex CLI](https://github.com/openai/codex) (GPT-5.x) as an independent code/plan reviewer, with built-in verification to filter false positives.
+A Claude Code user-level skill that uses [OpenAI Codex CLI](https://github.com/openai/codex) as an independent code/plan reviewer, with built-in verification to filter false positives.
+
+Current local baseline: Claude Code 2.1.150 and codex-cli 0.133.0.
 
 ## What it does
 
 - Runs Codex in read-only sandbox mode to review plans or code diffs
+- Uses a portable timeout wrapper so hung Codex reviews do not wedge Claude Code
+- Supports both Codex's default `exec review` prompt and custom-focus reviews via captured diffs
 - Claude verifies each Codex finding against the actual code before fixing
-- Produces a verification table (Confirmed / False Positive / Noted)
-- Commits with audit trail documenting what was found and fixed
+- Produces a verification table (Confirmed / Partially Valid / False Positive / Noted / Stale)
+- Can include an audit trail in commits documenting what was found and fixed
 
 ## Why two models?
 
@@ -37,13 +41,24 @@ In Claude Code, say any of:
 
 Claude will automatically capture the relevant diff, run Codex, verify findings, and present results.
 
+You can also invoke the helper directly:
+
+```bash
+~/.claude/skills/codex-review/scripts/codex-review.sh --help
+~/.claude/skills/codex-review/scripts/codex-review.sh git-uncommitted
+~/.claude/skills/codex-review/scripts/codex-review.sh git-base main
+~/.claude/skills/codex-review/scripts/codex-review.sh git-base-custom main
+```
+
+Use the `*-custom` modes when you need your own focus prompt. Codex 0.133 rejects a positional prompt together with `--base`, `--uncommitted`, or `--commit` on `codex exec review`, so the helper captures the diff and runs plain `codex exec` for those cases.
+
 ## Files
 
 ```
 codex-review/
 ├── SKILL.md                    # Skill instructions
 └── scripts/
-    └── codex-review.sh         # Helper: plan | code | git-uncommitted | git-base <branch> | git-commit <sha>
+    └── codex-review.sh         # Helper: plan | code | git-* | git-*-custom
 ```
 
 ## License
