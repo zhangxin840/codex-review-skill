@@ -147,6 +147,32 @@ pgrep -af "codex exec" | head
 pkill -9 -f "codex exec" 2>/dev/null
 ```
 
+**Per-session hang propagation**: per upstream observations (openai/codex
+issue [#24407](https://github.com/openai/codex/issues/24407)), the
+hang is session-level — once one codex invocation wedges in a given
+shell, *subsequent invocations from the same shell may hang too*.
+Always `pkill -9 -f "codex exec"` and confirm `pgrep -af "codex exec"`
+returns empty before retrying. If you started codex from inside a
+shell that's still in your task list, kill the wrapping shell too.
+
+## Known Upstream Bugs (codex 0.130–0.133)
+
+These are tracked OpenAI Codex CLI bugs that this skill defends against.
+Reference them in commit messages or status reports when relevant so the
+team can monitor upstream fixes.
+
+| Issue | Affects | Defense in this skill |
+|-------|---------|-----------------------|
+| [#24407](https://github.com/openai/codex/issues/24407) `apply_patch` / `file_change` tool deadlocks (kind:add wedges, no `turn.completed`) | All 0.125–0.133 | Mandatory `codex_with_timeout` wrapper kills the process tree. |
+| [#24278](https://github.com/openai/codex/issues/24278) Linux bwrap sandboxed `exec_command` fails | 0.131–0.133 (Linux only) | We force `--sandbox read-only` which doesn't trigger bwrap exec; if you hit bwrap errors anyway, set `-c 'sandbox_mode="workspace-write"'` for the review (output capture still goes via `-o`). |
+| [#24388](https://github.com/openai/codex/issues/24388) Remote compaction deadlocks with image payloads in compacted history | All recent | Don't pass `-i/--image` to review runs; the skill doesn't use it. |
+| [#24341/#24407](https://github.com/openai/codex/issues/24407) Symlinked-install sandbox init failure | Linux when codex lives under `~/.local/bin` | If repeated bwrap errors: `which codex` and confirm it's the real binary, not a symlink. |
+
+**As of 2026-05-26**: 0.133.0 is the latest stable; 0.134.0 is in alpha
+(`0.134.0-alpha.3` on npm, not yet `latest`). The mutual exclusion
+between scope flags (`--base`/`--uncommitted`/`--commit`) and the
+positional `[PROMPT]` is **NOT** relaxed in any alpha so far.
+
 ## Review Modes
 
 ### Mode 1: Plan Review (free-form prompt)
@@ -495,5 +521,21 @@ for custom prompts.
 
 ## Maintenance Note
 
-Last verified on 2026-05-26 against Claude Code 2.1.150 and codex-cli 0.133.0;
-re-check both versions plus `codex exec --help` / `codex exec review --help`.
+Last verified 2026-05-26 against Claude Code 2.1.150 and codex-cli 0.133.0
+(latest stable; 0.134.0 is alpha-only on npm). Re-check by running:
+
+```bash
+codex --version
+npm view @openai/codex version          # latest stable
+npm view @openai/codex dist-tags         # see "latest" + "alpha" channels
+codex exec --help | head -60
+codex exec review --help | head -60
+```
+
+Bump the "Known Upstream Bugs" table when GitHub issues #24407 / #24278
+/ #24388 close (check
+[openai/codex/issues](https://github.com/openai/codex/issues)). Bump
+the "Verified Flag Reference" table when `--help` shows new flags.
+
+Cadence: re-verify on every codex minor bump (cadence: ~1/week as of
+2026-05) or whenever a fresh hang/error is observed in production.

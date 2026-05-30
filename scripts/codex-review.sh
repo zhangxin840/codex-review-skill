@@ -85,6 +85,15 @@ fi
 # Clear stale output so a previous run can't masquerade as the current one.
 rm -f "$OUTPUT_FILE"
 
+# Track codex's exit code separately. T5 (2026-05-26 validation) caught:
+# without this, a timeout (rc=143 SIGTERM) propagates through set -e and the
+# script exits 143 instead of reaching the documented "empty output → exit 2"
+# branch. The OUTPUT_FILE check below is the authoritative success signal.
+CODEX_RC=0
+# Temporarily disable -e so the dispatcher case can complete even when the
+# embedded codex call exits non-zero. We re-enable -e after the case.
+set +e
+
 # --- Portable timeout wrapper ----------------------------------------------
 # macOS doesn't ship GNU `timeout`; coreutils provides `gtimeout`. Fall back
 # to a shell watchdog when neither is present. The fallback kills the process
@@ -283,12 +292,22 @@ $FOCUS_CODE"
     exit 1
     ;;
 esac
+CODEX_RC=$?
+set -e
 
 # Echo the review to stdout for convenience
 if [[ -s "$OUTPUT_FILE" ]]; then
   cat "$OUTPUT_FILE"
 else
-  echo "Warning: codex produced no final message — likely timed out (${TIMEOUT_SECS}s) or hit an API error." >&2
-  echo "Re-run with smaller scope, ASCII-only prompt, or higher CODEX_REVIEW_TIMEOUT env var." >&2
+  # Empty output = wedge (#24407) or upstream API stall. Per upstream
+  # observations the hang is session-level, so blind in-process retry usually
+  # won't help — but we kill any stale codex procs first so an external
+  # operator-triggered retry has a clean slate.
+  pkill -9 -f "codex exec" 2>/dev/null || true
+  echo "Warning: codex produced no final message — likely timed out (${TIMEOUT_SECS}s), hit OpenAI API stall, or wedged on apply_patch deadlock (openai/codex#24407)." >&2
+  echo "Stale 'codex exec' processes killed. To retry:" >&2
+  echo "  1. Confirm clean shell: pgrep -af 'codex exec'  # should be empty" >&2
+  echo "  2. Re-run with: smaller scope, ASCII-only prompt, or higher CODEX_REVIEW_TIMEOUT (current: ${TIMEOUT_SECS}s)" >&2
+  echo "  3. If repeatedly fails: try in a fresh shell; per-session wedges are documented upstream." >&2
   exit 2
 fi
