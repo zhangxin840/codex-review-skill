@@ -51,8 +51,10 @@ codex doctor 2>&1 | tail -5       # confirm auth/runtime health (codex 0.131+)
 ```
 
 Tested against **Claude Code 2.1.150** and **codex-cli 0.133.0** (both
-current on npm as of 2026-05-26). All flags below were verified against
-`codex exec review --help` and `codex exec --help` on this version. Official
+current on npm as of 2026-05-26); re-confirmed working on **codex-cli 0.141.0**
+(2026-06-23) — the read-only review path is unchanged, and a stdin-block guard
+(`</dev/null`) was added after observing it on that version. All flags below
+were verified against `codex exec review --help` and `codex exec --help`. Official
 OpenAI docs describe `codex exec` as the scripted / CI-style non-interactive
 entrypoint; official Claude Code docs describe skills as `SKILL.md` files under
 `~/.claude/skills/<skill-name>/` that can be invoked directly with
@@ -127,11 +129,17 @@ codex_with_timeout() {
   fi
 }
 
-# Use it:
+# Use it (note the </dev/null — see "stdin block" below):
 codex_with_timeout 600 codex exec --sandbox read-only \
   -c 'approval_policy="never"' --ephemeral --skip-git-repo-check \
-  -o /tmp/codex-review-output.md "your prompt"
+  -o /tmp/codex-review-output.md "your prompt" </dev/null
 ```
+
+**Redirect stdin (`</dev/null`).** Even with the prompt passed as a positional
+argument, codex can block on *"Reading additional input from stdin..."* and sit
+there until the timeout fires — burning the full 600s for nothing. Always append
+`</dev/null` to `codex exec` / `codex exec review` calls. (Confirmed against
+0.141.0; the helper script already does this.)
 
 If the wrapper kills codex (timeout fires), the output file will be
 0 bytes or partial. **Treat that as a failure signal and report it
@@ -459,6 +467,9 @@ Co-Authored-By: Claude <noreply@anthropic.com>
   override prevents that.
 - **Do not pass `--full-auto`.** Deprecated since codex 0.128; current
   Codex emits a warning and steers you to `--sandbox <mode>` instead.
+- **Redirect stdin with `</dev/null`.** codex may block on *"Reading
+  additional input from stdin..."* even with a positional prompt, wasting the
+  whole timeout. The helper already does this; do it in manual calls too.
 - **Use `-o /tmp/codex-review-output.md`** to capture the final review
   cleanly. Codex writes only the final assistant message to the `-o`
   file; progress/boot lines stay on the terminal stream.

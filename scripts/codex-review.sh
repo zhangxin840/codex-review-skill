@@ -163,13 +163,17 @@ run_codex_exec() {
   # $1 = prompt
   # --skip-git-repo-check: plan/code/*-custom modes are explicitly non-git path.
   # -c approval_policy="never": prevent TTY stalls if user config requires approval.
+  # </dev/null: codex otherwise blocks on "Reading additional input from stdin..."
+  #   even though the prompt is a positional arg — without it the call burns the
+  #   full timeout instead of returning (observed on codex 0.141.0).
   with_timeout "$TIMEOUT_SECS" codex exec \
     --sandbox read-only \
     -c 'approval_policy="never"' \
     --ephemeral \
     --skip-git-repo-check \
     -o "$OUTPUT_FILE" \
-    "$1"
+    "$1" \
+    </dev/null
 }
 
 run_codex_review_default_prompt() {
@@ -177,12 +181,14 @@ run_codex_review_default_prompt() {
   # NOTE: codex 0.133 rejects [PROMPT] together with --base/--uncommitted/--commit.
   # We therefore don't append FOCUS_CODE here — Codex's built-in review prompt
   # applies. For custom focus, use the *-custom modes which capture diff + exec.
+  # </dev/null: same stdin-block guard as run_codex_exec.
   with_timeout "$TIMEOUT_SECS" codex exec review \
     -c 'sandbox_mode="read-only"' \
     -c 'approval_policy="never"' \
     --ephemeral \
     -o "$OUTPUT_FILE" \
-    "$@"
+    "$@" \
+    </dev/null
 }
 
 # Only the default scratch path is auto-deleted. Caller-supplied paths are preserved.
