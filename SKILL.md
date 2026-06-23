@@ -19,409 +19,150 @@ argument-hint: "[plan|code|git-uncommitted|git-base <branch>|git-commit <sha>]"
 
 Use Codex CLI as an independent reviewer (model and reasoning effort come from
 the user's `~/.codex/config.toml`). Two different model families catching
-different issues is more reliable than one model reviewing itself.
+different issues is more reliable than one model reviewing itself: Codex finds
+issues, Claude verifies each before fixing. The verification step is
+non-negotiable because Codex has a ~15–20% false-positive rate on complex diffs.
 
-The key value is two models collaborating: Codex finds issues, Claude verifies
-before fixing. Every finding goes through a verification step because Codex
-has a ~15-20% false positive rate on complex diffs.
+> Not the same as `/code-review` or `/review` — those are *Claude* reviewing the
+> diff. This skill dispatches to *Codex*, a different model family. Reach for it
+> when the user wants a genuine second opinion or cross-validation.
 
-> Note: Claude Code includes a bundled `/code-review` skill, and user/project
-> commands can add review prompts such as `/review`. Those are *Claude*
-> reviewing the diff. This skill is different: it dispatches to Codex (a
-> different model family). Prefer it when the user explicitly wants a *second
-> opinion* or cross-validation, not just "review my code".
+## When to proactively suggest
 
-## When to Proactively Suggest
+Even unprompted, consider offering a Codex review when:
+- a multi-file refactor touched 5+ files with cross-references (contracts, configs, schemas)
+- an architectural change altered terminology or data flow across the codebase
+- a release is being prepared and the changes haven't been independently reviewed
 
-Even if the user doesn't ask, consider suggesting a Codex review when:
-- A multi-file refactor touched 5+ files with cross-references (contracts,
-  configs, schemas)
-- An architectural change altered terminology or data flow across the codebase
-- A release is being prepared and the changes haven't been independently reviewed
-
-Don't suggest for trivial changes (typo fixes, single-file edits,
-documentation-only).
+Skip it for trivial changes (typos, single-file edits, docs-only).
 
 ## Prerequisites
 
 ```bash
-which codex && codex --version    # ensure codex is installed (need 0.130+)
-codex doctor 2>&1 | tail -5       # confirm auth/runtime health (codex 0.131+)
-# If not installed: brew install --cask codex   OR   npm i -g @openai/codex
+which codex && codex --version    # need 0.130+
+codex doctor 2>&1 | tail -5       # auth/runtime health (0.131+)
+# install: brew install --cask codex   OR   npm i -g @openai/codex
 ```
 
-Tested against **Claude Code 2.1.150** and **codex-cli 0.133.0** (both
-current on npm as of 2026-05-26); re-confirmed working on **codex-cli 0.141.0**
-(2026-06-23) — the read-only review path is unchanged, and a stdin-block guard
-(`</dev/null`) was added after observing it on that version. All flags below
-were verified against `codex exec review --help` and `codex exec --help`. Official
-OpenAI docs describe `codex exec` as the scripted / CI-style non-interactive
-entrypoint; official Claude Code docs describe skills as `SKILL.md` files under
-`~/.claude/skills/<skill-name>/` that can be invoked directly with
-`/skill-name`.
+Verified against codex-cli 0.133.0 and re-confirmed on 0.141.0. Full flag
+reference and re-verification steps: `references/codex-cli.md`.
 
-## Preferred Helper
+## Run it: prefer the helper
 
-Prefer the bundled helper script when running this skill. It centralizes the
-current Codex flags, timeout wrapper, stale-output cleanup, and custom diff
-capture logic:
+The bundled helper centralizes the current flags, the kill-on-timeout wrapper,
+the `</dev/null` stdin guard, stale-output cleanup, and diff capture — so you
+don't have to get all of that right by hand. **It is the single source of truth
+for how to invoke codex; use it unless you're debugging the helper itself.**
 
 ```bash
-"${CLAUDE_SKILL_DIR}/scripts/codex-review.sh" --help
-"${CLAUDE_SKILL_DIR}/scripts/codex-review.sh" git-uncommitted
-"${CLAUDE_SKILL_DIR}/scripts/codex-review.sh" git-base main
-"${CLAUDE_SKILL_DIR}/scripts/codex-review.sh" git-base-custom main
-```
+"${CLAUDE_SKILL_DIR}/scripts/codex-review.sh" --help            # all modes
 
-Use the manual commands below only when you need to adapt a one-off review or
-debug the helper. The helper echoes Codex's final review to stdout and writes
-the same final message to `${CODEX_REVIEW_OUTPUT:-/tmp/codex-review-output.md}`.
-
-## ⚠️ Hard Rule: Always Wrap Codex with a Timeout
-
-**Codex has been observed to hang silently for 30-40+ minutes** on some
-prompts (suspected triggers: Unicode math symbols like σ²/β/X'X in the
-prompt text, transient OpenAI API stalls, very long prompts >2000 chars).
-The Bash tool's `timeout` parameter only bounds the Bash call — if the
-codex process is backgrounded or the parent shell waits on the output
-file, codex itself keeps running.
-
-**Always invoke codex through a kill-on-timeout wrapper** so the child
-process gets killed regardless of how the Bash call is structured.
-
-### Portable timeout wrapper (works on macOS + Linux)
-
-GNU `timeout` is preinstalled on Linux but **NOT on macOS** (you'd need
-`brew install coreutils`, which gives you `gtimeout`). Use this auto-fallback:
-
-```bash
-# Pick the first available: gtimeout (mac with coreutils), timeout (linux),
-# else a shell-based process-tree watchdog (always available).
-kill_tree() {
-  local pid="$1"
-  local child
-  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
-    kill_tree "$child"
-  done
-  kill -TERM "$pid" 2>/dev/null || true
-  sleep 1
-  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
-    kill_tree "$child"
-  done
-  kill -KILL "$pid" 2>/dev/null || true
-}
-
-codex_with_timeout() {
-  local secs="$1"; shift
-  if command -v gtimeout >/dev/null 2>&1; then
-    gtimeout -k 5s "$secs" "$@"
-  elif command -v timeout >/dev/null 2>&1; then
-    timeout -k 5s "$secs" "$@"
-  else
-    "$@" &
-    local pid=$!
-    ( sleep "$secs" && kill -0 "$pid" 2>/dev/null && kill_tree "$pid" ) &
-    local watchdog=$!
-    wait "$pid"
-    local rc=$?
-    kill "$watchdog" 2>/dev/null
-    return $rc
-  fi
-}
-
-# Use it (note the </dev/null — see "stdin block" below):
-codex_with_timeout 600 codex exec --sandbox read-only \
-  -c 'approval_policy="never"' --ephemeral --skip-git-repo-check \
-  -o /tmp/codex-review-output.md "your prompt" </dev/null
-```
-
-**Redirect stdin (`</dev/null`).** Even with the prompt passed as a positional
-argument, codex can block on *"Reading additional input from stdin..."* and sit
-there until the timeout fires — burning the full 600s for nothing. Always append
-`</dev/null` to `codex exec` / `codex exec review` calls. (Confirmed against
-0.141.0; the helper script already does this.)
-
-If the wrapper kills codex (timeout fires), the output file will be
-0 bytes or partial. **Treat that as a failure signal and report it
-honestly** — do NOT poll the output file indefinitely (this skill's
-previous version had a poll loop that hung the calling agent for tens
-of minutes).
-
-Recovery if codex DID hang earlier in the session:
-
-```bash
-pgrep -af "codex exec" | head
-# kill the codex *binary* PIDs (deepest child) AND the wrapping node/zsh PIDs
-pkill -9 -f "codex exec" 2>/dev/null
-```
-
-**Per-session hang propagation**: per upstream observations (openai/codex
-issue [#24407](https://github.com/openai/codex/issues/24407)), the
-hang is session-level — once one codex invocation wedges in a given
-shell, *subsequent invocations from the same shell may hang too*.
-Always `pkill -9 -f "codex exec"` and confirm `pgrep -af "codex exec"`
-returns empty before retrying. If you started codex from inside a
-shell that's still in your task list, kill the wrapping shell too.
-
-## Known Upstream Bugs (codex 0.130–0.133)
-
-These are tracked OpenAI Codex CLI bugs that this skill defends against.
-Reference them in commit messages or status reports when relevant so the
-team can monitor upstream fixes.
-
-| Issue | Affects | Defense in this skill |
-|-------|---------|-----------------------|
-| [#24407](https://github.com/openai/codex/issues/24407) `apply_patch` / `file_change` tool deadlocks (kind:add wedges, no `turn.completed`) | All 0.125–0.133 | Mandatory `codex_with_timeout` wrapper kills the process tree. |
-| [#24278](https://github.com/openai/codex/issues/24278) Linux bwrap sandboxed `exec_command` fails | 0.131–0.133 (Linux only) | We force `--sandbox read-only` which doesn't trigger bwrap exec; if you hit bwrap errors anyway, set `-c 'sandbox_mode="workspace-write"'` for the review (output capture still goes via `-o`). |
-| [#24388](https://github.com/openai/codex/issues/24388) Remote compaction deadlocks with image payloads in compacted history | All recent | Don't pass `-i/--image` to review runs; the skill doesn't use it. |
-| [#24341/#24407](https://github.com/openai/codex/issues/24407) Symlinked-install sandbox init failure | Linux when codex lives under `~/.local/bin` | If repeated bwrap errors: `which codex` and confirm it's the real binary, not a symlink. |
-
-**As of 2026-05-26**: 0.133.0 is the latest stable; 0.134.0 is in alpha
-(`0.134.0-alpha.3` on npm, not yet `latest`). The mutual exclusion
-between scope flags (`--base`/`--uncommitted`/`--commit`) and the
-positional `[PROMPT]` is **NOT** relaxed in any alpha so far.
-
-## Review Modes
-
-### Mode 1: Plan Review (free-form prompt)
-
-Use this for reviewing implementation plans, design docs, or anything that
-isn't a git diff. Also use this when you need a **custom prompt against a
-specific diff scope** — `codex exec review` doesn't accept a custom prompt
-together with a scope flag (see Mode 2 caveat).
-
-1. Write content to `/tmp/codex-review-input.md` (the input file).
-2. Prefer the helper:
-
-```bash
+# Plan / design doc (or any non-git content): write it to a file first
 "${CLAUDE_SKILL_DIR}/scripts/codex-review.sh" plan /tmp/codex-review-input.md
-```
+"${CLAUDE_SKILL_DIR}/scripts/codex-review.sh" code /tmp/diff.patch
 
-3. Manual equivalent if debugging the helper:
-
-```bash
-# Using the codex_with_timeout shell function defined above
-codex_with_timeout 600 codex exec \
-  --sandbox read-only \
-  -c 'approval_policy="never"' \
-  --ephemeral \
-  --skip-git-repo-check \
-  -o /tmp/codex-review-output.md \
-  "You are reviewing an implementation plan. Read /tmp/codex-review-input.md and evaluate it.
-
-Focus on:
-1. Risks: What could go wrong? Missing error handling, race conditions, breaking changes?
-2. Gaps: Are there steps missing? Dependencies not accounted for?
-3. Alternatives: Is there a simpler or more robust approach to any step?
-4. Order: Are the steps in the right sequence? Any parallelization opportunities?
-
-Be specific and actionable. If everything looks solid, say so briefly — don't manufacture issues.
-Output your review in markdown."
-```
-
-4. Verify the output file actually has content:
-
-```bash
-ls -la /tmp/codex-review-output.md
-test -s /tmp/codex-review-output.md && cat /tmp/codex-review-output.md \
-  || echo "ERROR: codex output empty — likely timed out or hit an API error"
-```
-
-### Mode 2: Code Review (git changes, no custom prompt)
-
-When you trust Codex's default review prompt and just want it pointed at a
-specific scope of changes, use the dedicated `codex exec review` subcommand
-**without** a custom prompt argument. Pick exactly one scope flag:
-
-| Scope flag | Reviews |
-|------------|---------|
-| `--uncommitted` | Staged + unstaged + untracked changes |
-| `--base <branch>` | All changes on the current branch vs. base |
-| `--commit <SHA>` | Just the changes introduced by a single commit |
-
-Prefer the helper:
-
-```bash
+# Git scope, Codex's built-in review prompt:
 "${CLAUDE_SKILL_DIR}/scripts/codex-review.sh" git-uncommitted
 "${CLAUDE_SKILL_DIR}/scripts/codex-review.sh" git-base main
 "${CLAUDE_SKILL_DIR}/scripts/codex-review.sh" git-commit <SHA>
-```
 
-Manual equivalent:
-
-```bash
-codex_with_timeout 600 codex exec review \
-  -c 'sandbox_mode="read-only"' \
-  -c 'approval_policy="never"' \
-  --ephemeral \
-  --base main \
-  --title "Refactor: extract ranking pipeline into its own module" \
-  -o /tmp/codex-review-output.md
-```
-
-Notes:
-- `--ephemeral`, `-o`, `--skip-git-repo-check`, and `--output-schema` ARE
-  all available on `codex exec review` (verified against 0.133.0 help).
-- `--title` is just a label that shows in Codex's review summary.
-- Codex applies its built-in review prompt — focused on bugs, contracts,
-  consistency, regressions — when you don't pass your own.
-
-### Mode 2-custom: Code Review with custom focus prompt
-
-⚠️ **`codex exec review` rejects a custom prompt together with a scope flag**:
-
-```
-error: the argument '--base <BRANCH>' cannot be used with '[PROMPT]'
-```
-
-This is by design in codex 0.133: scope flags (`--base`/`--uncommitted`/
-`--commit`) and the positional `[PROMPT]` are mutually exclusive. If you
-need both — a specific diff scope AND your own focus list — use the helper's
-custom modes, which capture the diff and then run plain `codex exec`:
-
-```bash
-"${CLAUDE_SKILL_DIR}/scripts/codex-review.sh" git-uncommitted-custom
+# Git scope + YOUR own focus prompt (captures the diff, then runs codex exec):
 "${CLAUDE_SKILL_DIR}/scripts/codex-review.sh" git-base-custom main
+"${CLAUDE_SKILL_DIR}/scripts/codex-review.sh" git-uncommitted-custom
 "${CLAUDE_SKILL_DIR}/scripts/codex-review.sh" git-commit-custom <SHA>
 ```
 
-Manual equivalent:
+The helper echoes Codex's final review to stdout and also writes it to
+`${CODEX_REVIEW_OUTPUT:-/tmp/codex-review-output.md}`. Tune the timeout with
+`CODEX_REVIEW_TIMEOUT` (default 600s).
 
-```bash
-# Capture the exact scope you want
-git diff main..HEAD > /tmp/codex-review-input.md
-# For uncommitted changes, include staged, unstaged, and untracked file content.
-# The helper does this for you; don't capture only `git status`.
-git diff --cached --binary > /tmp/codex-review-input.md
-git diff --binary >> /tmp/codex-review-input.md
-# For untracked files, append `git diff --no-index --binary -- /dev/null <file>`.
-# For single commits, use: git show --binary <SHA> > /tmp/codex-review-input.md
+**If the helper prints an empty-output warning, the review FAILED** (timeout /
+API stall / wedge) — do not invent a review. See `references/failure-modes.md`
+for recovery (`pkill -9 -f "codex exec"`, then retry smaller/simpler).
 
-# Then run Mode 1's `codex exec` (NOT `codex exec review`) with --skip-git-repo-check
-codex_with_timeout 600 codex exec \
-  --sandbox read-only \
-  -c 'approval_policy="never"' \
-  --ephemeral \
-  --skip-git-repo-check \
-  -o /tmp/codex-review-output.md \
-  "Review the diff at /tmp/codex-review-input.md.
+Manual invocation (only when adapting a one-off or debugging the helper)
+requires the portable timeout wrapper and the stdin guard — both are in
+`references/failure-modes.md`. Don't hand-roll a bare `codex exec`; on macOS
+there's no `timeout` and a bare call can hang for tens of minutes.
 
-  Context: <one-sentence what changed and why>
-  Scope notes: <e.g., 'binaries excluded by design', 'WIP — error paths intentional'>
+## Choosing a mode
 
-  Focus on:
-  1. Bugs: Logic errors, cross-references that don't match, broken contracts
-  2. Consistency: Do all files agree on the same terminology and data flow?
-  3. Gaps: What happens in failure cases? Missing fallbacks?
-  4. Backward compatibility: Could these changes break existing behavior?
+- **Plan / design doc, or a custom prompt against a specific diff** → `plan`
+  (or `*-custom` for a git scope). `codex exec review` can't take a custom
+  prompt together with a scope flag, so a custom focus always goes through the
+  capture-diff-then-`codex exec` path.
+- **Git scope, trust Codex's default review prompt** → `git-uncommitted` /
+  `git-base` / `git-commit`. Reviews staged+unstaged+untracked / branch-vs-base
+  / a single commit respectively.
+- **A patch file or non-git diff** → `code`.
 
-  For each finding: file:line + severity (critical/warning/suggestion).
-  If solid, say so briefly. Under 700 words."
-```
+`--base`/`--uncommitted`/`--commit` and a positional `[PROMPT]` are mutually
+exclusive in codex — that's why the custom modes exist (details in
+`references/codex-cli.md`).
 
-## Review Prompt Grounding
+## Ground the review prompt
 
-For custom review prompts, ground Codex in the exact scope:
+Codex is far more useful asked to check specific invariants than given a vague
+"review for bugs". For custom prompts (`plan` / `*-custom`):
 
-- Declare exclusions up front. If the diff is text-only, path-filtered,
-  staged-only, or excludes binaries, say that explicitly so Codex does not
-  flag intentionally missing artifacts.
-- For large diffs (>1000 lines), list suspected weak spots as concrete
-  verification questions with file/line pointers. Codex is much more useful
-  when asked to check specific invariants than when given only "review for
-  bugs".
-- Ask contract questions, not taste questions: "does `T13_COLUMNS` match the
-  customer schema and e2e tests?" is useful; "is this design good?" is not.
-- If Codex says a metadata/key/alias should be removed or denied, first grep
-  for runtime readers before deleting it. Some "leaked" keys are load-bearing
-  cross-file contracts.
+- **Pre-compute the evidence into the input file.** Don't make Codex hunt —
+  hand it the diff *plus* the output of the checks a good reviewer would run:
+  dependency cross-checks, greps for leftover/stale references, before/after of
+  files you edited, a one-line statement of intent. Then tell it *"rely on this
+  file; only spot-read a few files to confirm, don't scan whole repos."* This
+  both sharpens findings and stops Codex from wandering (which causes timeouts).
+- **For multi-repo or large reviews**, this matters most: `cd` into one git repo,
+  pass the scope through the input file, and keep Codex from crawling every tree.
+- **Declare exclusions up front** — if the diff is text-only, staged-only, or
+  excludes binaries, say so, or Codex flags intentionally-missing artifacts.
+- **Ask contract questions, not taste questions**: "does `T13_COLUMNS` match the
+  customer schema and the e2e tests?" beats "is this design good?".
+- **Before deleting anything Codex flags as unused** (a key/alias/metadata),
+  grep for runtime readers first — some "leaked" keys are load-bearing contracts.
 
-## Prompt Hygiene (avoid the hang traps)
+## Post-review: verify-then-fix protocol
 
-Real-world hangs observed against codex 0.133 traced to one or more of:
+After receiving Codex output, do NOT blindly apply fixes. Every finding is
+verified first.
 
-- **Unicode math / superscript symbols** in the prompt: `σ²`, `β`, `X'X`,
-  `²`, `√`, `≤`. Suspected shell-escape or tokenizer interaction.
-  → Use ASCII equivalents: `sigma2`, `beta`, `XtX`, `sqrt`, `<=`.
-- **Very long single-line prompts** (>2000 chars). Multi-line via real
-  newlines is fine; gigantic one-liners are not.
-  → If your focus list is long, save it as a file and reference it from
-  the prompt: write `/tmp/codex-focus.md` then say in the prompt
-  "Read /tmp/codex-focus.md for the focus list."
-- **Embedded LaTeX or backtick-heavy math notation**.
-  → Same fix: ASCII or a file.
-- **Multiple competing shell-escape layers** (Bash double-quote inside
-  single-quote inside zsh `eval`). Codex's argv parser sometimes stalls.
-  → Prefer here-doc to a temp file, then `cat`:
-
-```bash
-cat > /tmp/codex-prompt.txt <<'PROMPT_EOF'
-Review the diff at /tmp/codex-review-input.md.
-
-Focus on:
-1. Bugs
-2. Consistency
-3. Gaps
-
-For each finding: file:line + severity. Under 700 words.
-PROMPT_EOF
-
-codex_with_timeout 600 codex exec --sandbox read-only -c 'approval_policy="never"' \
-  --ephemeral --skip-git-repo-check \
-  -o /tmp/codex-review-output.md \
-  "$(cat /tmp/codex-prompt.txt)"
-```
-
-## Post-Review: Verify-then-Fix Protocol
-
-After receiving Codex output, do NOT blindly apply fixes. Each finding
-goes through verification.
-
-### Step 1: Present Codex findings
+### Step 1 — Present the findings
 
 ```
 ## Codex Review (<Codex model from config — typically gpt-5.x>)
-<Codex's review, lightly cleaned up if it has redundant formatting>
+<Codex's review, lightly cleaned up if formatting is redundant>
 ---
 *Reviewed by Codex CLI in read-only sandbox mode*
 ```
 
-### Step 2: Verify each finding
-
-For every finding Codex reports, Claude checks the actual files:
+### Step 2 — Verify each finding against the actual files
 
 ```
 For each finding:
-  1. Read the specific file and line Codex references
-  2. Check if the issue actually exists (Codex may misread diffs)
-  3. If Codex claims File A contradicts File B — read both files and confirm
+  1. Read the specific file:line Codex references
+  2. Check the issue actually exists (Codex may misread the diff)
+  3. If it claims File A contradicts File B — read both and confirm
   4. Classify:
-     - CONFIRMED: issue exists, needs fix
-     - PARTIALLY VALID: real issue but severity/scope differs
-     - FALSE POSITIVE: Codex misread the code or context
-     - NOTED: valid observation but acceptable trade-off
-     - STALE: Codex referenced a file:line that doesn't match the current
-       diff (e.g., cached prior-session output) — re-run review on the
-       fresh diff before acting
+     - CONFIRMED:       real, needs fix
+     - PARTIALLY VALID: real but severity/scope differs
+     - FALSE POSITIVE:  Codex misread the code or context
+     - NOTED:           valid observation, acceptable trade-off
+     - STALE:           file:line doesn't match the current diff (likely a
+                        prior session's cached output) — re-run on the fresh diff
 ```
 
-Present as a verification table:
+Present a verification table:
 
 | # | Codex Finding | Severity | Claude Verdict | Action |
 |---|--------------|----------|---------------|--------|
-| 1 | description... | critical | **Confirmed** | Fix: ... |
-| 2 | description... | warning | **False positive** | No action (reason) |
+| 1 | description… | critical | **Confirmed** | Fix: … |
+| 2 | description… | warning | **False positive** | No action (reason) |
 
-### Step 3: Fix only confirmed issues
+### Step 3 — Fix only what's real
 
-Apply fixes for CONFIRMED and PARTIALLY VALID findings. Skip FALSE
-POSITIVE. Document NOTED items in commit message. Re-run review on STALE
-findings if they look load-bearing.
+Apply CONFIRMED and PARTIALLY VALID. Skip FALSE POSITIVE. Document NOTED items
+in the commit. Re-run review on STALE findings that look load-bearing.
 
-### Step 4: Commit with audit trail
-
-Include Codex review results in commit message so the review history is
-preserved:
+### Step 4 — Commit with an audit trail
 
 ```
 fix: address Codex review findings — <summary>
@@ -436,117 +177,45 @@ Not fixed (acceptable):
 Co-Authored-By: Claude <noreply@anthropic.com>
 ```
 
-## Why Verification Matters
+Match the repo's existing `Co-Authored-By` convention rather than hardcoding one.
 
-- **Codex's strength**: Cross-file consistency — it catches when File A
-  says X but File B says Y (e.g., a config says "hard gate" but the code
-  treats it as soft, or an API contract defines one output path but the
-  caller writes to another).
+## Why verification matters
 
-- **Codex's weakness**: It can over-report on large diffs, conflate design
-  choices with bugs, miss context that explains why something is
-  intentional, and occasionally return STALE output (the `-o` file appears
-  to contain a prior session's review when codex partially fails on the
-  current call). Always sanity-check the first finding's file:line against
-  the actual diff before trusting the rest.
+- **Codex's strength** — cross-file consistency: it catches File A saying X
+  while File B says Y (a config calls something a hard gate but the code treats
+  it as soft; an API contract defines one output path but the caller writes
+  another).
+- **Codex's weakness** — it over-reports on large diffs, conflates design
+  choices with bugs, misses context that makes something intentional, and
+  occasionally returns STALE output. Sanity-check the first finding's file:line
+  against the real diff before trusting the rest.
+- **~15–20% false positives** in practice. Skipping verification means fixing
+  non-issues and introducing new bugs.
 
-- **False positive rate**: ~15-20% in practice. Without verification, you
-  risk fixing non-issues and introducing new bugs.
+## Key constraints
 
-## Important Constraints
+- **Read-only, always.** The review must never modify files: `--sandbox
+  read-only` (`codex exec`) or `-c 'sandbox_mode="read-only"'` (`codex exec
+  review`). The user's default sandbox may be `workspace-write` — the explicit
+  override matters. The helper does this for you.
+- **`-c 'approval_policy="never"'`** so an unattended run can't stall on a TTY
+  approval prompt. (Do **not** use the deprecated `--full-auto`.)
+- **`--ephemeral`** — reviews are one-shot; don't pollute `~/.codex/sessions/`.
+- **Capture with `-o <file>`, guard stdin with `</dev/null`, wrap in a
+  timeout.** All three are in the helper; if you go manual, see
+  `references/failure-modes.md` — skipping any of them risks empty output or a
+  multi-minute hang.
+- **Empty output = failure, not "looks clean".** Report it honestly and proceed
+  without the review (or retry simpler). Never poll-wait on the output file.
+- **Clean up** `/tmp/codex-review-*.md` after manual reviews (the helper cleans
+  its own default scratch input).
 
-- **Always force read-only sandbox.** Codex must never modify files
-  during review. Use `--sandbox read-only` (Mode 1) or
-  `-c 'sandbox_mode="read-only"'` (Mode 2). The user's default
-  `sandbox_mode` may be `workspace-write` or `danger-full-access`; the
-  explicit override matters.
-- **Always force `approval_policy="never"`** if running unattended. The
-  skill no longer passes the deprecated `--full-auto`. On machines where
-  the user's config sets `approval_policy = "on-request"` or similar, the
-  command will stall on a TTY prompt forever. The `-c 'approval_policy="never"'`
-  override prevents that.
-- **Do not pass `--full-auto`.** Deprecated since codex 0.128; current
-  Codex emits a warning and steers you to `--sandbox <mode>` instead.
-- **Redirect stdin with `</dev/null`.** codex may block on *"Reading
-  additional input from stdin..."* even with a positional prompt, wasting the
-  whole timeout. The helper already does this; do it in manual calls too.
-- **Use `-o /tmp/codex-review-output.md`** to capture the final review
-  cleanly. Codex writes only the final assistant message to the `-o`
-  file; progress/boot lines stay on the terminal stream.
-- **Add `--ephemeral`** so review runs don't add entries to
-  `~/.codex/sessions/` history. Reviews are one-shot — nothing to resume.
-- **Always wrap with the portable timeout helper** (see top of this file).
-  Claude Code's Bash timeout and a parent-only `kill` are not enough when
-  codex's node shim launches a native child process.
-- **If `/tmp/codex-review-output.md` is empty or 0 bytes** after the
-  command completes (or after `timeout` exit 124), do NOT poll-wait for
-  it. Report the failure: "Codex review didn't produce output — likely
-  timed out or hit an API error. Proceeding without it OR retrying with
-  simplified prompt." The skill's previous version had a poll loop that
-  could hang the calling agent for tens of minutes.
-- **Don't fabricate output** — if the command fails, report the error
-  honestly and proceed without the review.
-- **Clean up** — `rm -f /tmp/codex-review-input.md /tmp/codex-prompt.txt
-  /tmp/codex-review-output.md` after manual reviews. The helper removes only
-  its default scratch input and preserves caller-supplied input files.
+## Quick decision tree
 
-## Verified Flag Reference (codex 0.133.0)
-
-`codex exec` (Mode 1):
-
-| Flag | Purpose |
-|------|---------|
-| `--sandbox read-only` | Disallow file writes during the review |
-| `-c 'KEY="VAL"'` | Override config (`sandbox_mode`, `approval_policy`, `model_reasoning_effort`, ...) |
-| `--ephemeral` | Don't persist session to `~/.codex/sessions/` |
-| `--skip-git-repo-check` | Allow running outside a git repo (needed for diff files) |
-| `-o <FILE>` | Write only the final assistant message to this file |
-| `-m <MODEL>` | Override the configured model for this run |
-| `-C, --cd <DIR>` | Change working directory before running |
-| `-p, --profile <NAME>` | Use a named profile from config.toml |
-| `--json` | Emit JSONL event stream on stdout |
-| `--output-schema <FILE>` | Constrain final answer to a JSON schema |
-
-`codex exec review` (Mode 2) supports these confirmed common flags:
-`-c/--config`, `-m/--model`, `--skip-git-repo-check`, `--ephemeral`,
-`--ignore-user-config`, `--ignore-rules`, `--output-schema`, `--json`, and
-`-o/--output-last-message`. It does **not** expose `-C/--cd`,
-`-p/--profile`, `--profile-v2`, `-s/--sandbox`, `-i/--image`, `--add-dir`,
-`--oss`, `--local-provider`, or `--color`. It adds review scope flags:
-`--uncommitted`, `--base <BRANCH>`, `--commit <SHA>`, and `--title <T>`.
-
-⚠️ **Mutually exclusive**: scope flag + positional `[PROMPT]`. Use Mode 2
-for default review against a scope, Mode 1 (with manually-captured diff)
-for custom prompts.
-
-## Quick Decision Tree
-
-- **Plan / design doc review** → Mode 1
-- **Git scope (branch/commit/uncommitted) + Codex's default review prompt**
-  → Mode 2
-- **Git scope + your own focus list** → Mode 2-custom (capture diff +
-  Mode 1)
-- **Already inside a long session and codex appears stuck** → check
-  `pgrep -af "codex exec"`, kill with `pkill -9 -f "codex exec"`,
-  then either re-run with simpler prompt or proceed without the review
-
-## Maintenance Note
-
-Last verified 2026-05-26 against Claude Code 2.1.150 and codex-cli 0.133.0
-(latest stable; 0.134.0 is alpha-only on npm). Re-check by running:
-
-```bash
-codex --version
-npm view @openai/codex version          # latest stable
-npm view @openai/codex dist-tags         # see "latest" + "alpha" channels
-codex exec --help | head -60
-codex exec review --help | head -60
-```
-
-Bump the "Known Upstream Bugs" table when GitHub issues #24407 / #24278
-/ #24388 close (check
-[openai/codex/issues](https://github.com/openai/codex/issues)). Bump
-the "Verified Flag Reference" table when `--help` shows new flags.
-
-Cadence: re-verify on every codex minor bump (cadence: ~1/week as of
-2026-05) or whenever a fresh hang/error is observed in production.
+- Plan / design doc → `plan`
+- Git scope + Codex's default review prompt → `git-uncommitted` / `git-base` / `git-commit`
+- Git scope + your own focus list → `git-*-custom`
+- Patch file / non-git diff → `code`
+- Codex appears stuck → `pgrep -af "codex exec"`, `pkill -9 -f "codex exec"`,
+  confirm empty, then retry simpler or proceed without it
+  (`references/failure-modes.md`)
